@@ -9,84 +9,49 @@ public class WallapopOffer {
     private String price;
     private String url;
     private String imageUrl;
-    private boolean isNew;
+    private double priceValue;
     private LocalDateTime detectedAt;
     
     public WallapopOffer() {
     }
     
-    public WallapopOffer(String id, String title, String price, String url) {
+    public WallapopOffer(String id, String title, String price, String url, double priceValue) {
         this.id = id;
         this.title = title;
         this.price = price;
         this.url = url;
-        this.isNew = true;
+        this.priceValue = priceValue;
         this.detectedAt = LocalDateTime.now();
     }
     
-    public String getId() {
-        return id;
-    }
+    public String getId() { return id; }
+    public void setId(String id) { this.id = id; }
     
-    public void setId(String id) {
-        this.id = id;
-    }
+    public String getTitle() { return title; }
+    public void setTitle(String title) { this.title = title; }
     
-    public String getTitle() {
-        return title;
-    }
+    public String getPrice() { return price; }
+    public void setPrice(String price) { this.price = price; }
     
-    public void setTitle(String title) {
-        this.title = title;
-    }
+    public String getUrl() { return url; }
+    public void setUrl(String url) { this.url = url; }
     
-    public String getPrice() {
-        return price;
-    }
+    public String getImageUrl() { return imageUrl; }
+    public void setImageUrl(String imageUrl) { this.imageUrl = imageUrl; }
     
-    public void setPrice(String price) {
-        this.price = price;
-    }
+    public double getPriceValue() { return priceValue; }
+    public void setPriceValue(double priceValue) { this.priceValue = priceValue; }
     
-    public String getUrl() {
-        return url;
-    }
-    
-    public void setUrl(String url) {
-        this.url = url;
-    }
-    
-    public String getImageUrl() {
-        return imageUrl;
-    }
-    
-    public void setImageUrl(String imageUrl) {
-        this.imageUrl = imageUrl;
-    }
-    
-    public boolean isNew() {
-        return isNew;
-    }
-    
-    public void setNew(boolean aNew) {
-        isNew = aNew;
-    }
-    
-    public LocalDateTime getDetectedAt() {
-        return detectedAt;
-    }
-    
-    public void setDetectedAt(LocalDateTime detectedAt) {
-        this.detectedAt = detectedAt;
-    }
+    public LocalDateTime getDetectedAt() { return detectedAt; }
+    public void setDetectedAt(LocalDateTime detectedAt) { this.detectedAt = detectedAt; }
     
     public String toTelegramMessage() {
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm");
         return String.format(
-            "🆕 *NOVEDAD en Wallapop*\n\n" +
-            "📦 *%s*\n" +
-            "💰 Precio: *%s*\n" +
-            "🔗 [Ver oferta](%s)\n" +
+            "🆕 *Oferta Encontrada*\n\n" +
+            "📦 %s\n" +
+            "💰 *%s*\n" +
+            "🔗 [Ver en Wallapop](%s)\n" +
             "⏰ %s",
             escapeMarkdown(title),
             escapeMarkdown(price),
@@ -103,17 +68,6 @@ public class WallapopOffer {
                    .replace("]", "\\]")
                    .replace("(", "\\(")
                    .replace(")", "\\)")
-                   .replace("~", "\\~")
-                   .replace("`", "\\`")
-                   .replace(">", "\\>")
-                   .replace("#", "\\#")
-                   .replace("+", "\\+")
-                   .replace("-", "\\-")
-                   .replace("=", "\\=")
-                   .replace("|", "\\|")
-                   .replace("{", "\\{")
-                   .replace("}", "\\}")
-                   .replace(".", "\\.")
-                   .replace("!", "\\!");
+                   .replace("`", "\\`");
     }
 }

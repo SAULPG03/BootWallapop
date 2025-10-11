@@ -1,87 +1,86 @@
 package com.saul.botwallapop.scheduler;
 
-import java.time.LocalDateTime;
-import java.util.List;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.stereotype.Component;
-import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
-
 import com.saul.botwallapop.model.BotState;
 import com.saul.botwallapop.model.WallapopOffer;
 import com.saul.botwallapop.service.TelegramBotService;
-import com.saul.botwallapop.service.WallapopScraperService;
+import com.saul.botwallapop.service.WallapopSearchService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
 
 @Component
 public class WallapopScheduler {
     
     private static final Logger log = LoggerFactory.getLogger(WallapopScheduler.class);
     
-    private final WallapopScraperService scraperService;
-    private final TelegramBotService telegramBotService;
+    private final WallapopSearchService searchService;
+    private final TelegramBotService telegramService;
     private final BotState botState;
     
-    public WallapopScheduler(WallapopScraperService scraperService,
-                            TelegramBotService telegramBotService,
+    @Value("${wallapop.check.interval.minutes:10}")
+    private int checkInterval;
+    
+    public WallapopScheduler(WallapopSearchService searchService,
+                            TelegramBotService telegramService,
                             BotState botState) {
-        this.scraperService = scraperService;
-        this.telegramBotService = telegramBotService;
+        this.searchService = searchService;
+        this.telegramService = telegramService;
         this.botState = botState;
     }
     
-    @Scheduled(fixedDelayString = "${wallapop.check.interval.minutes:5}0000", initialDelay = 30000)
-    public void checkWallapopFavorites() {
-        // Solo escanear si el bot está activo
-        if (!botState.isRunning()) {
-            log.debug("Bot pausado, saltando escaneo");
+    @Scheduled(fixedDelayString = "${wallapop.check.interval.minutes:10}0000", 
+               initialDelay = 60000)
+    public void checkProducts() {
+        log.info("🔍 Escaneando productos configurados...");
+        
+        Map<String, List<WallapopOffer>> results = searchService.searchAllProducts();
+        botState.setLastCheck(LocalDateTime.now());
+        
+        if (results.isEmpty()) {
+            log.info("✅ No hay ofertas nuevas");
             return;
         }
         
-        if (!scraperService.isLoggedIn()) {
-            log.warn("No hay sesión activa en Wallapop, saltando escaneo");
-            return;
-        }
+        int newOffers = 0;
         
-        log.info("🔍 Iniciando escaneo automático de Wallapop...");
-        
-        try {
-            List<WallapopOffer> offers = scraperService.checkFavorites();
-            botState.setLastCheck(LocalDateTime.now());
+        for (Map.Entry<String, List<WallapopOffer>> entry : results.entrySet()) {
+            String productName = entry.getKey();
+            List<WallapopOffer> offers = entry.getValue();
             
-            if (offers.isEmpty()) {
-                log.info("✅ Escaneo completado. No hay nuevas ofertas");
-            } else {
-                log.info("🎉 Encontradas {} ofertas con NOVEDAD", offers.size());
+            log.info("📦 {}: {} ofertas", productName, offers.size());
+            
+            // Notificar a todos los usuarios autorizados
+            for (String userId : botState.getAuthorizedUsers()) {
+                Long chatId = Long.parseLong(userId);
                 
-                // Enviar notificaciones a todos los usuarios autorizados
-                for (String userId : botState.getAuthorizedUsers()) {
-                    for (WallapopOffer offer : offers) {
-                        // Evitar duplicados
-                        if (!botState.getProcessedOfferIds().contains(offer.getId())) {
-                            telegramBotService.sendOfferNotification(Long.parseLong(userId), offer);
-                            botState.getProcessedOfferIds().add(offer.getId());
-                            botState.setTotalOffersFound(botState.getTotalOffersFound() + 1);
+                for (WallapopOffer offer : offers) {
+                    // Evitar notificar la misma oferta dos veces
+                    if (!botState.wasNotified(offer.getId())) {
+                        telegramService.sendMessage(chatId, 
+                            String.format("🎉 *Nueva oferta de %s*", productName));
+                        telegramService.sendOfferNotification(chatId, offer);
+                        
+                        botState.addNotified(offer.getId());
+                        newOffers++;
+                        
+                        try { Thread.sleep(1000); } 
+                        catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
                         }
                     }
                 }
             }
-            
-        } catch (Exception e) {
-            log.error("❌ Error durante el escaneo automático: {}", e.getMessage(), e);
-            
-            // Notificar el error a los usuarios
-            for (String userId : botState.getAuthorizedUsers()) {
-                try {
-                    SendMessage errorMsg = new SendMessage();
-                    errorMsg.setChatId(userId);
-                    errorMsg.setText("⚠️ Error durante el escaneo automático: " + e.getMessage());
-                    // No enviamos para evitar spam de errores
-                } catch (Exception notificationError) {
-                    log.error("Error enviando notificación de error", notificationError);
-                }
-            }
+        }
+        
+        if (newOffers > 0) {
+            botState.setTotalOffersFound(botState.getTotalOffersFound() + newOffers);
+            log.info("🎉 {} nuevas ofertas notificadas", newOffers);
         }
     }
 }

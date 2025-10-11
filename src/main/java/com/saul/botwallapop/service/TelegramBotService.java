@@ -1,10 +1,14 @@
 package com.saul.botwallapop.service;
 
-import com.saul.botwallapop.model.BotState;
-import com.saul.botwallapop.model.WallapopOffer;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
@@ -14,277 +18,220 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.Keyboard
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardRow;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
 
-import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.List;
+import com.saul.botwallapop.model.BotState;
+import com.saul.botwallapop.model.ProductConfig;
+import com.saul.botwallapop.model.WallapopOffer;
 
 @Component
 public class TelegramBotService extends TelegramLongPollingBot {
-    
+
     private static final Logger log = LoggerFactory.getLogger(TelegramBotService.class);
-    
+
     @Value("${telegram.bot.token}")
     private String botToken;
-    
+
     @Value("${telegram.bot.username}")
     private String botUsername;
-    
+
     private final BotState botState;
-    private final WallapopScraperService scraperService;
-    
-    public TelegramBotService(BotState botState, WallapopScraperService scraperService) {
+    private final WallapopSearchService searchService;
+
+    public TelegramBotService(BotState botState, WallapopSearchService searchService) {
         this.botState = botState;
-        this.scraperService = scraperService;
+        this.searchService = searchService;
     }
-    
+
     @Override
-    public String getBotUsername() {
-        return botUsername;
-    }
-    
+    public String getBotUsername() { return botUsername; }
+
     @Override
-    public String getBotToken() {
-        return botToken;
-    }
-    
+    public String getBotToken() { return botToken; }
+
     @Override
     public void onUpdateReceived(Update update) {
-        if (update.hasMessage() && update.getMessage().hasText()) {
-            String messageText = update.getMessage().getText();
-            Long chatId = update.getMessage().getChatId();
-            String userId = update.getMessage().getFrom().getId().toString();
-            String userName = update.getMessage().getFrom().getFirstName();
-            
-            log.info("Mensaje recibido de {}: {}", userName, messageText);
-            
-            // Si es el primer mensaje, autorizar al usuario
-            if (botState.getAuthorizedUsers().isEmpty()) {
-                botState.addAuthorizedUser(userId);
-                log.info("Usuario {} autorizado (primer usuario)", userName);
-            }
-            
-            // Verificar autorización
-            if (!botState.isUserAuthorized(userId)) {
-                sendMessage(chatId, "❌ No estás autorizado para usar este bot.");
-                return;
-            }
-            
-            // Procesar comandos
-            switch (messageText.toLowerCase()) {
-                case "/start":
-                    handleStart(chatId, userName);
-                    break;
-                case "/help":
-                    handleHelp(chatId);
-                    break;
-                case "▶️ iniciar monitoreo":
-                    handleStartMonitoring(chatId);
-                    break;
-                case "⏸️ pausar monitoreo":
-                    handlePauseMonitoring(chatId);
-                    break;
-                case "🔍 escanear ahora":
-                    handleScanNow(chatId);
-                    break;
-                case "📊 estado":
-                    handleStatus(chatId);
-                    break;
-                case "🔐 login wallapop":
-                    handleLogin(chatId);
-                    break;
-                case "❌ cerrar sesión":
-                    handleLogout(chatId);
-                    break;
-                default:
-                    sendMessage(chatId, "❓ Comando no reconocido. Usa /help para ver los comandos disponibles.");
-            }
+        if (!update.hasMessage() || !update.getMessage().hasText()) return;
+
+        String messageText = update.getMessage().getText();
+        Long chatId = update.getMessage().getChatId();
+        String userId = update.getMessage().getFrom().getId().toString();
+        String userName = update.getMessage().getFrom().getFirstName();
+
+        log.info("Mensaje de {}: {}", userName, messageText);
+
+        // Autorizar primer usuario automáticamente
+        if (botState.getAuthorizedUsers().isEmpty()) {
+            botState.addAuthorizedUser(userId);
+            log.info("Usuario {} autorizado", userName);
+        }
+
+        if (!botState.isUserAuthorized(userId)) {
+            sendMessage(chatId, "❌ No autorizado");
+            return;
+        }
+
+        switch (messageText.toLowerCase().trim()) {
+            case "/start" -> handleStart(chatId, userName);
+            case "/help" -> handleHelp(chatId);
+            case "/buscar", "buscar" -> handleSearchAll(chatId);
+            case "/productos", "productos" -> handleListProducts(chatId);
+            case "/estado", "estado" -> handleStatus(chatId);
+            default -> sendMessage(chatId, "❓ Usa /help para ver comandos");
         }
     }
-    
+
     private void handleStart(Long chatId, String userName) {
-        String welcomeMessage = String.format(
-            "👋 ¡Hola %s! Bienvenido al Bot de Wallapop\n\n" +
-            "🤖 Soy tu asistente para monitorear ofertas con ¡NOVEDAD! en tus favoritos de Wallapop.\n\n" +
-            "Para empezar:\n" +
-            "1️⃣ Primero haz login con: 🔐 Login Wallapop\n" +
-            "2️⃣ Luego inicia el monitoreo: ▶️ Iniciar Monitoreo\n\n" +
-            "Usa /help para ver todos los comandos disponibles.",
-            userName
+        String message = String.format(
+            "👋 ¡Hola %s!\n\n🤖 *Bot de Wallapop*\n\n" +
+            "Te notificaré automáticamente si encuentro nuevas ofertas.\n\n" +
+            "Usa /help para ver comandos", userName
         );
-        
-        sendMessageWithKeyboard(chatId, welcomeMessage);
+        sendMessageWithKeyboard(chatId, message);
     }
-    
+
     private void handleHelp(Long chatId) {
-        String helpMessage = 
-            "📚 *Comandos Disponibles*\n\n" +
-            "▶️ *Iniciar Monitoreo* - Comienza a escanear favoritos cada 5 minutos\n" +
-            "⏸️ *Pausar Monitoreo* - Detiene el escaneo automático\n" +
-            "🔍 *Escanear Ahora* - Realiza un escaneo manual inmediato\n" +
-            "📊 *Estado* - Muestra el estado actual del bot\n" +
-            "🔐 *Login Wallapop* - Inicia sesión en Wallapop\n" +
-            "❌ *Cerrar Sesión* - Cierra la sesión de Wallapop\n\n" +
-            "💡 *Tip:* Asegúrate de iniciar sesión antes de comenzar el monitoreo.";
-        
-        sendMessage(chatId, helpMessage);
+        String message =
+            "📚 *Comandos*\n\n" +
+            "*Buscar* - Buscar todos los productos ahora\n" +
+            "*Productos* - Ver productos configurados\n" +
+            "*Estado* - Ver estadísticas\n\n" +
+            "💡 El bot busca automáticamente cada 10 minutos";
+        sendMessage(chatId, message);
     }
-    
-    private void handleStartMonitoring(Long chatId) {
-        if (!scraperService.isLoggedIn()) {
-            sendMessage(chatId, "⚠️ Primero debes iniciar sesión en Wallapop.\nUsa: 🔐 Login Wallapop");
-            return;
+
+    private void handleListProducts(Long chatId) {
+        List<ProductConfig> products = searchService.getConfiguredProducts();
+        StringBuilder sb = new StringBuilder("📋 *Productos Monitoreados:*\n\n");
+        for (int i = 0; i < products.size(); i++) {
+            ProductConfig p = products.get(i);
+            sb.append(String.format("%d. %s\n   Precio mínimo: %.2f€\n\n",
+                i + 1, p.getName(), p.getMinPrice()));
         }
-        
-        botState.setRunning(true);
-        sendMessage(chatId, "✅ *Monitoreo iniciado*\n\nEscanearé tus favoritos cada 5 minutos y te notificaré de nuevas ofertas con ¡NOVEDAD!");
-        log.info("Monitoreo iniciado");
+        sendMessage(chatId, sb.toString());
     }
-    
-    private void handlePauseMonitoring(Long chatId) {
-        botState.setRunning(false);
-        sendMessage(chatId, "⏸️ *Monitoreo pausado*\n\nPuedes reactivarlo cuando quieras con: ▶️ Iniciar Monitoreo");
-        log.info("Monitoreo pausado");
-    }
-    
-    private void handleScanNow(Long chatId) {
-        if (!scraperService.isLoggedIn()) {
-            sendMessage(chatId, "⚠️ Primero debes iniciar sesión en Wallapop.");
-            return;
-        }
-        
-        sendMessage(chatId, "🔍 Escaneando favoritos...");
-        
-        try {
-            List<WallapopOffer> offers = scraperService.checkFavorites();
-            
-            if (offers.isEmpty()) {
-                sendMessage(chatId, "✅ Escaneo completado\n\nNo se encontraron nuevas ofertas con ¡NOVEDAD!");
-            } else {
-                sendMessage(chatId, String.format("🎉 Encontradas *%d* ofertas nuevas:", offers.size()));
-                
-                for (WallapopOffer offer : offers) {
-                    if (!botState.getProcessedOfferIds().contains(offer.getId())) {
-                        sendOfferNotification(chatId, offer);
-                        botState.getProcessedOfferIds().add(offer.getId());
-                        botState.setTotalOffersFound(botState.getTotalOffersFound() + 1);
-                    }
-                }
-            }
-        } catch (Exception e) {
-            log.error("Error durante escaneo manual", e);
-            sendMessage(chatId, "❌ Error durante el escaneo: " + e.getMessage());
-        }
-    }
-    
+
     private void handleStatus(Long chatId) {
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
-        
+
         String status = String.format(
-            "📊 *Estado del Bot*\n\n" +
-            "🟢 Estado: %s\n" +
-            "🔐 Sesión Wallapop: %s\n" +
-            "📦 Ofertas encontradas: %d\n" +
+            "📊 *Estado*\n\n" +
+            "📦 Ofertas enviadas: %d\n" +
             "🕐 Último escaneo: %s\n" +
-            "👥 Usuarios autorizados: %d",
-            botState.isRunning() ? "Activo" : "Pausado",
-            scraperService.isLoggedIn() ? "✅ Conectada" : "❌ Desconectada",
-            botState.getTotalOffersFound(),
+            "👥 Usuarios autorizados: %d\n" +
+            "🔍 Productos: %d",
+            botState.getNotifiedOffers().size(),
             botState.getLastCheck() != null ? botState.getLastCheck().format(formatter) : "Nunca",
-            botState.getAuthorizedUsers().size()
+            botState.getAuthorizedUsers().size(),
+            searchService.getConfiguredProducts().size()
         );
-        
+
         sendMessage(chatId, status);
     }
-    
-    private void handleLogin(Long chatId) {
-        sendMessage(chatId, "🔐 Iniciando sesión en Wallapop...\n\nEsto puede tardar unos segundos.");
-        
-        try {
-            boolean success = scraperService.login();
-            
-            if (success) {
-                botState.setLoggedIn(true);
-                sendMessage(chatId, "✅ *Sesión iniciada correctamente*\n\n¡Ya puedes comenzar el monitoreo!");
-            } else {
-                sendMessage(chatId, "❌ *Error al iniciar sesión*\n\nVerifica tus credenciales en el archivo de configuración.");
-            }
-        } catch (Exception e) {
-            log.error("Error durante login", e);
-            sendMessage(chatId, "❌ Error: " + e.getMessage());
+
+    private void handleSearchAll(Long chatId) {
+        sendMessage(chatId, "🔍 Buscando todos los productos...");
+
+        Map<String, List<WallapopOffer>> results = searchService.searchAllProducts();
+
+        if (results.isEmpty()) {
+            sendMessage(chatId, "❌ No se encontraron ofertas que cumplan los criterios");
+            return;
         }
+
+        int totalNewOffers = 0;
+
+        for (Map.Entry<String, List<WallapopOffer>> entry : results.entrySet()) {
+            String productName = entry.getKey();
+            List<WallapopOffer> offers = entry.getValue();
+
+            List<WallapopOffer> newOffersForProduct = new ArrayList<>();
+            for (WallapopOffer offer : offers) {
+                if (!botState.isOfferNotified(offer.getUrl())) {
+                    newOffersForProduct.add(offer);
+                }
+            }
+
+            if (newOffersForProduct.isEmpty()) continue;
+
+            sendMessage(chatId, String.format(
+                "📦 *%s*\nEncontradas %d nuevas ofertas:",
+                productName, newOffersForProduct.size()
+            ));
+
+            for (WallapopOffer offer : newOffersForProduct) {
+                sendOfferNotification(chatId, offer);
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+            }
+
+            totalNewOffers += newOffersForProduct.size();
+        }
+
+        sendMessage(chatId, String.format("✅ Total nuevas ofertas enviadas: %d", totalNewOffers));
     }
-    
-    private void handleLogout(Long chatId) {
-        scraperService.closeDriver();
-        botState.setLoggedIn(false);
-        botState.setRunning(false);
-        sendMessage(chatId, "❌ Sesión cerrada. El monitoreo se ha detenido.");
-    }
-    
+
     public void sendOfferNotification(Long chatId, WallapopOffer offer) {
+        if (botState.isOfferNotified(offer.getUrl())) return;
+
         try {
             SendMessage message = new SendMessage();
             message.setChatId(chatId.toString());
             message.setText(offer.toTelegramMessage());
             message.setParseMode("Markdown");
             message.disableWebPagePreview();
-            
             execute(message);
-            log.info("Notificación enviada al usuario {}", chatId);
-            
+
+            botState.markOfferAsNotified(offer.getUrl());
         } catch (TelegramApiException e) {
-            log.error("Error enviando notificación: {}", e.getMessage());
+            log.error("Error enviando oferta: {}", e.getMessage());
         }
     }
-    
+
     private void sendMessage(Long chatId, String text) {
         try {
             SendMessage message = new SendMessage();
             message.setChatId(chatId.toString());
             message.setText(text);
             message.setParseMode("Markdown");
-            
             execute(message);
-            
         } catch (TelegramApiException e) {
             log.error("Error enviando mensaje: {}", e.getMessage());
         }
     }
-    
+
     private void sendMessageWithKeyboard(Long chatId, String text) {
         try {
             SendMessage message = new SendMessage();
             message.setChatId(chatId.toString());
             message.setText(text);
-            
-            // Crear teclado personalizado
-            ReplyKeyboardMarkup keyboardMarkup = new ReplyKeyboardMarkup();
-            List<KeyboardRow> keyboard = new ArrayList<>();
-            
+            message.setParseMode("Markdown");
+
+            ReplyKeyboardMarkup keyboard = new ReplyKeyboardMarkup();
+            List<KeyboardRow> rows = new ArrayList<>();
+
             KeyboardRow row1 = new KeyboardRow();
-            row1.add(new KeyboardButton("▶️ Iniciar Monitoreo"));
-            row1.add(new KeyboardButton("⏸️ Pausar Monitoreo"));
-            
+            row1.add(new KeyboardButton("Buscar"));
+            row1.add(new KeyboardButton("Productos"));
+
             KeyboardRow row2 = new KeyboardRow();
-            row2.add(new KeyboardButton("🔍 Escanear Ahora"));
-            row2.add(new KeyboardButton("📊 Estado"));
-            
-            KeyboardRow row3 = new KeyboardRow();
-            row3.add(new KeyboardButton("🔐 Login Wallapop"));
-            row3.add(new KeyboardButton("❌ Cerrar Sesión"));
-            
-            keyboard.add(row1);
-            keyboard.add(row2);
-            keyboard.add(row3);
-            
-            keyboardMarkup.setKeyboard(keyboard);
-            keyboardMarkup.setResizeKeyboard(true);
-            message.setReplyMarkup(keyboardMarkup);
-            
+            row2.add(new KeyboardButton("Estado"));
+
+            rows.add(row1);
+            rows.add(row2);
+
+            keyboard.setKeyboard(rows);
+            keyboard.setResizeKeyboard(true);
+            message.setReplyMarkup(keyboard);
+
             execute(message);
-            
         } catch (TelegramApiException e) {
             log.error("Error enviando mensaje con teclado: {}", e.getMessage());
+        }
+    }
+
+    // 🔹 Notificaciones automáticas cada 10 minutos
+    @Scheduled(fixedRate = 600_000) // 600_000 ms = 10 minutos
+    public void scheduledSearchAndNotify() {
+        for (String userId : botState.getAuthorizedUsers()) {
+            handleSearchAll(Long.parseLong(userId));
         }
     }
 }

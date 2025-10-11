@@ -1,0 +1,13 @@
+package com.saul.botwallapop;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@EnableScheduling
+public class WallapopBotApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(WallapopBotApplication.class, args);
+    }
+}
