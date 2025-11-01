@@ -1,10 +1,8 @@
 package com.saul.botwallapop.service;
 
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-
+import java.util.*;
+import java.util.concurrent.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -12,15 +10,13 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardMarkup;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardButton;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.KeyboardRow;
 import org.telegram.telegrambots.meta.exceptions.TelegramApiException;
-
-import com.saul.botwallapop.model.BotState;
-import com.saul.botwallapop.model.ProductConfig;
-import com.saul.botwallapop.model.WallapopOffer;
+import com.saul.botwallapop.model.*;
 
 @Component
 public class TelegramBotService extends TelegramLongPollingBot {
@@ -36,9 +32,23 @@ public class TelegramBotService extends TelegramLongPollingBot {
     private final BotState botState;
     private final WallapopSearchService searchService;
 
+    // Cola de mensajes a enviar
+    private final BlockingQueue<SendMessage> messageQueue = new LinkedBlockingQueue<>();
+
+    // Lista de mensajes enviados (para /limpiar)
+    private final List<Integer> mensajesEnviados = new CopyOnWriteArrayList<>();
+
+    // Ejecutores
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+    // ID del último grupo donde se recibió un mensaje
+    @Value("${telegram.group.id}")
+    private volatile Long lastGroupChatId;
+
     public TelegramBotService(BotState botState, WallapopSearchService searchService) {
         this.botState = botState;
         this.searchService = searchService;
+        iniciarProcesadorDeCola();
     }
 
     @Override
@@ -47,191 +57,249 @@ public class TelegramBotService extends TelegramLongPollingBot {
     @Override
     public String getBotToken() { return botToken; }
 
+    // -------------------- PROCESADOR DE COLA --------------------
+    private void iniciarProcesadorDeCola() {
+        scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                SendMessage msg = messageQueue.poll(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    enviarConReintentos(msg);
+                    Thread.sleep(40); // 25 mensajes por segundo máx (rate limit Telegram)
+                }
+            } catch (InterruptedException ignored) {
+            } catch (Exception e) {
+                log.error("Error procesando la cola de mensajes: {}", e.getMessage());
+            }
+        }, 0, 200, TimeUnit.MILLISECONDS);
+    }
+
+    private void enviarConReintentos(SendMessage msg) {
+        int intentos = 0;
+        int maxIntentos = 5;
+        long espera = 1000; // ms
+        while (intentos < maxIntentos) {
+            try {
+                var result = execute(msg);
+                mensajesEnviados.add(result.getMessageId());
+                return;
+            } catch (TelegramApiException e) {
+                intentos++;
+                if (e.getMessage().contains("Too Many Requests")) {
+                    espera *= 2; // backoff exponencial
+                    log.warn("Rate limit alcanzado. Esperando {}ms antes de reintentar...", espera);
+                } else {
+                    log.error("Error enviando mensaje (intento {}): {}", intentos, e.getMessage());
+                }
+                try { Thread.sleep(espera); } catch (InterruptedException ignored) {}
+            }
+        }
+        log.error("❌ No se pudo enviar el mensaje tras {} intentos", maxIntentos);
+    }
+
+    // -------------------- MANEJO DE UPDATES --------------------
     @Override
     public void onUpdateReceived(Update update) {
         if (!update.hasMessage() || !update.getMessage().hasText()) return;
 
-        String messageText = update.getMessage().getText();
-        Long chatId = update.getMessage().getChatId();
+        String text = update.getMessage().getText().trim().toLowerCase();
         String userId = update.getMessage().getFrom().getId().toString();
         String userName = update.getMessage().getFrom().getFirstName();
+        Long chatId = update.getMessage().getChatId();
 
-        log.info("Mensaje de {}: {}", userName, messageText);
+        log.info("Mensaje recibido de {}: {}", userName, text);
 
-        // Autorizar primer usuario automáticamente
-        if (botState.getAuthorizedUsers().isEmpty()) {
-            botState.addAuthorizedUser(userId);
-            log.info("Usuario {} autorizado", userName);
-        }
-
-        if (!botState.isUserAuthorized(userId)) {
-            sendMessage(chatId, "❌ No autorizado");
+        // Solo responde en grupos
+        if (!update.getMessage().isGroupMessage() && !update.getMessage().isSuperGroupMessage()) {
+            log.info("Ignorando mensaje fuera de un grupo.");
             return;
         }
 
-        switch (messageText.toLowerCase().trim()) {
-            case "/start" -> handleStart(chatId, userName);
-            case "/help" -> handleHelp(chatId);
-            case "/buscar", "buscar" -> handleSearchAll(chatId);
-            case "/productos", "productos" -> handleListProducts(chatId);
-            case "/estado", "estado" -> handleStatus(chatId);
-            default -> sendMessage(chatId, "❓ Usa /help para ver comandos");
+        // Guardamos este chat ID como último grupo activo
+        lastGroupChatId = chatId;
+
+        if (botState.getAuthorizedUsers().isEmpty()) botState.addAuthorizedUser(userId);
+        if (!botState.isUserAuthorized(userId)) {
+            enqueueTextToLastGroup("❌ No autorizado");
+            return;
+        }
+
+        switch (text) {
+            case "/start" -> handleStart();
+            case "/help" -> handleHelp();
+            case "/buscar", "buscar" -> handleSearchAll(false);
+            case "/productos", "productos" -> handleListProducts();
+            case "/estado", "estado" -> handleStatus();
+            case "/limpiar", "limpiar" -> handleLimpiar();
+            default -> enqueueTextToLastGroup("❓ Usa /help para ver comandos disponibles");
         }
     }
 
-    private void handleStart(Long chatId, String userName) {
-        String message = String.format(
-            "👋 ¡Hola %s!\n\n🤖 *Bot de Wallapop*\n\n" +
-            "Te notificaré automáticamente si encuentro nuevas ofertas.\n\n" +
-            "Usa /help para ver comandos", userName
-        );
-        sendMessageWithKeyboard(chatId, message);
+    // -------------------- COMANDOS --------------------
+    private void handleStart() {
+        String msg = """
+            👋 ¡Hola!
+
+            🤖 *Bot de Wallapop*
+            Te notificaré automáticamente si encuentro nuevas ofertas.
+
+            Usa /help para ver todos los comandos.
+            """;
+        enqueueTextWithKeyboard(msg);
     }
 
-    private void handleHelp(Long chatId) {
-        String message =
-            "📚 *Comandos*\n\n" +
-            "*Buscar* - Buscar todos los productos ahora\n" +
-            "*Productos* - Ver productos configurados\n" +
-            "*Estado* - Ver estadísticas\n\n" +
-            "💡 El bot busca automáticamente cada 10 minutos";
-        sendMessage(chatId, message);
+    private void handleHelp() {
+        enqueueTextToLastGroup("""
+            📚 *Comandos disponibles:*
+
+            /buscar - Buscar todos los productos ahora
+            /productos - Ver productos configurados
+            /estado - Ver estadísticas del bot
+            /limpiar - Borrar los mensajes del bot en el grupo
+
+            💡 El bot busca automáticamente cada 10 minutos.
+            """);
     }
 
-    private void handleListProducts(Long chatId) {
+    private void handleListProducts() {
         List<ProductConfig> products = searchService.getConfiguredProducts();
+        if (products.isEmpty()) {
+            enqueueTextToLastGroup("📦 No hay productos configurados aún.");
+            return;
+        }
+
         StringBuilder sb = new StringBuilder("📋 *Productos Monitoreados:*\n\n");
         for (int i = 0; i < products.size(); i++) {
             ProductConfig p = products.get(i);
-            sb.append(String.format("%d. %s\n   Precio mínimo: %.2f€\n\n",
-                i + 1, p.getName(), p.getMinPrice()));
+            sb.append(String.format("%d. %s\n   Precio mínimo: %.2f€\n\n", i + 1, p.getName(), p.getMinPrice()));
         }
-        sendMessage(chatId, sb.toString());
+        enqueueTextToLastGroup(sb.toString());
     }
 
-    private void handleStatus(Long chatId) {
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
+    private void handleStatus() {
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
+        String msg = String.format("""
+            📊 *Estado del Bot*
 
-        String status = String.format(
-            "📊 *Estado*\n\n" +
-            "📦 Ofertas enviadas: %d\n" +
-            "🕐 Último escaneo: %s\n" +
-            "👥 Usuarios autorizados: %d\n" +
-            "🔍 Productos: %d",
+            📦 Ofertas enviadas: %d
+            🕐 Último escaneo: %s
+            👥 Usuarios autorizados: %d
+            🔍 Productos configurados: %d
+            """,
             botState.getNotifiedOffers().size(),
-            botState.getLastCheck() != null ? botState.getLastCheck().format(formatter) : "Nunca",
+            botState.getLastCheck() != null ? botState.getLastCheck().format(fmt) : "Nunca",
             botState.getAuthorizedUsers().size(),
             searchService.getConfiguredProducts().size()
         );
-
-        sendMessage(chatId, status);
+        enqueueTextToLastGroup(msg);
     }
 
-    private void handleSearchAll(Long chatId) {
-        sendMessage(chatId, "🔍 Buscando todos los productos...");
+    private void handleSearchAll(boolean automatic) {
+        if (!automatic) enqueueTextToLastGroup("🔍 Buscando todos los productos...");
 
         Map<String, List<WallapopOffer>> results = searchService.searchAllProducts();
-
         if (results.isEmpty()) {
-            sendMessage(chatId, "❌ No se encontraron ofertas que cumplan los criterios");
+            if (!automatic) enqueueTextToLastGroup("❌ No se encontraron ofertas que cumplan los criterios");
             return;
         }
 
-        int totalNewOffers = 0;
-
-        for (Map.Entry<String, List<WallapopOffer>> entry : results.entrySet()) {
-            String productName = entry.getKey();
+        int total = 0;
+        for (var entry : results.entrySet()) {
+            String product = entry.getKey();
             List<WallapopOffer> offers = entry.getValue();
+            List<WallapopOffer> newOffers = offers.stream()
+                .filter(o -> !botState.isOfferNotified(o.getUrl()))
+                .toList();
 
-            List<WallapopOffer> newOffersForProduct = new ArrayList<>();
-            for (WallapopOffer offer : offers) {
-                if (!botState.isOfferNotified(offer.getUrl())) {
-                    newOffersForProduct.add(offer);
-                }
+            if (newOffers.isEmpty()) continue;
+
+            if (!automatic) enqueueTextToLastGroup(String.format("📦 *%s*\nEncontradas %d nuevas ofertas:", product, newOffers.size()));
+
+            for (WallapopOffer o : newOffers) {
+                if (automatic) sendOfferToLastGroup(o);
+                else sendOffer(o);
             }
-
-            if (newOffersForProduct.isEmpty()) continue;
-
-            sendMessage(chatId, String.format(
-                "📦 *%s*\nEncontradas %d nuevas ofertas:",
-                productName, newOffersForProduct.size()
-            ));
-
-            for (WallapopOffer offer : newOffersForProduct) {
-                sendOfferNotification(chatId, offer);
-                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
-            }
-
-            totalNewOffers += newOffersForProduct.size();
+            total += newOffers.size();
         }
 
-        sendMessage(chatId, String.format("✅ Total nuevas ofertas enviadas: %d", totalNewOffers));
+        if (!automatic) enqueueTextToLastGroup("✅ Total nuevas ofertas enviadas: " + total);
+        else if (total > 0) enqueueTextToLastGroup("✅ Total nuevas ofertas enviadas: " + total);
     }
 
-    public void sendOfferNotification(Long chatId, WallapopOffer offer) {
+    private void handleLimpiar() {
+        if (mensajesEnviados.isEmpty()) {
+            enqueueTextToLastGroup("⚠️ No hay mensajes que borrar.");
+            return;
+        }
+        int borrados = 0;
+        for (Integer id : new ArrayList<>(mensajesEnviados)) {
+            if (deleteMessage(lastGroupChatId, id)) borrados++;
+        }
+        mensajesEnviados.clear();
+        enqueueTextToLastGroup("🧹 Chat limpiado (" + borrados + " mensajes borrados).");
+    }
+
+    // -------------------- UTILIDADES DE ENVÍO --------------------
+    public void enqueueTextToLastGroup(String text) {
+        if (lastGroupChatId == null) {
+            log.warn("No hay grupo activo para enviar el mensaje automático.");
+            return;
+        }
+        SendMessage msg = new SendMessage(lastGroupChatId.toString(), text);
+        msg.setParseMode("Markdown");
+        messageQueue.offer(msg);
+    }
+
+    private void enqueueTextWithKeyboard(String text) {
+        if (lastGroupChatId == null) return;
+
+        SendMessage msg = new SendMessage(lastGroupChatId.toString(), text);
+        msg.setParseMode("Markdown");
+
+        ReplyKeyboardMarkup keyboard = new ReplyKeyboardMarkup();
+        keyboard.setResizeKeyboard(true);
+
+        KeyboardRow row1 = new KeyboardRow();
+        row1.add(new KeyboardButton("Buscar"));
+        row1.add(new KeyboardButton("Productos"));
+
+        KeyboardRow row2 = new KeyboardRow();
+        row2.add(new KeyboardButton("Estado"));
+        row2.add(new KeyboardButton("Limpiar"));
+
+        keyboard.setKeyboard(List.of(row1, row2));
+        msg.setReplyMarkup(keyboard);
+
+        messageQueue.offer(msg);
+    }
+
+    public void sendOffer(WallapopOffer offer) {
+        if (lastGroupChatId == null) return;
         if (botState.isOfferNotified(offer.getUrl())) return;
+        SendMessage msg = new SendMessage(lastGroupChatId.toString(), offer.toTelegramMessage());
+        msg.setParseMode("Markdown");
+        msg.disableWebPagePreview();
+        messageQueue.offer(msg);
+        botState.markOfferAsNotified(offer.getUrl());
+    }
 
+    private void sendOfferToLastGroup(WallapopOffer offer) {
+        sendOffer(offer); // misma lógica
+    }
+
+    public boolean deleteMessage(Long chatId, Integer messageId) {
         try {
-            SendMessage message = new SendMessage();
-            message.setChatId(chatId.toString());
-            message.setText(offer.toTelegramMessage());
-            message.setParseMode("Markdown");
-            message.disableWebPagePreview();
-            execute(message);
-
-            botState.markOfferAsNotified(offer.getUrl());
+            execute(new DeleteMessage(chatId.toString(), messageId));
+            return true;
         } catch (TelegramApiException e) {
-            log.error("Error enviando oferta: {}", e.getMessage());
+            log.warn("No se pudo borrar el mensaje {}: {}", messageId, e.getMessage());
+            return false;
         }
     }
 
-    private void sendMessage(Long chatId, String text) {
-        try {
-            SendMessage message = new SendMessage();
-            message.setChatId(chatId.toString());
-            message.setText(text);
-            message.setParseMode("Markdown");
-            execute(message);
-        } catch (TelegramApiException e) {
-            log.error("Error enviando mensaje: {}", e.getMessage());
-        }
-    }
-
-    private void sendMessageWithKeyboard(Long chatId, String text) {
-        try {
-            SendMessage message = new SendMessage();
-            message.setChatId(chatId.toString());
-            message.setText(text);
-            message.setParseMode("Markdown");
-
-            ReplyKeyboardMarkup keyboard = new ReplyKeyboardMarkup();
-            List<KeyboardRow> rows = new ArrayList<>();
-
-            KeyboardRow row1 = new KeyboardRow();
-            row1.add(new KeyboardButton("Buscar"));
-            row1.add(new KeyboardButton("Productos"));
-
-            KeyboardRow row2 = new KeyboardRow();
-            row2.add(new KeyboardButton("Estado"));
-
-            rows.add(row1);
-            rows.add(row2);
-
-            keyboard.setKeyboard(rows);
-            keyboard.setResizeKeyboard(true);
-            message.setReplyMarkup(keyboard);
-
-            execute(message);
-        } catch (TelegramApiException e) {
-            log.error("Error enviando mensaje con teclado: {}", e.getMessage());
-        }
-    }
-
-    // 🔹 Notificaciones automáticas cada 10 minutos
-    @Scheduled(fixedRate = 600_000) // 600_000 ms = 10 minutos
+    // -------------------- ESCANEO AUTOMÁTICO --------------------
+    @Scheduled(fixedRate = 600_000)
     public void scheduledSearchAndNotify() {
-        for (String userId : botState.getAuthorizedUsers()) {
-            handleSearchAll(Long.parseLong(userId));
-        }
+        log.info("Ejecutando búsqueda automática...");
+        handleSearchAll(true);
     }
 }

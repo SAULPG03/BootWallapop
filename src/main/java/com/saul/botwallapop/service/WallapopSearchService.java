@@ -61,7 +61,7 @@ public class WallapopSearchService {
         if (driver != null) return;
 
         ChromeOptions options = new ChromeOptions();
-        // options.addArguments("--headless=new"); // modo headless opcional
+        options.addArguments("--headless=new"); // modo headless opcional
         options.addArguments("--disable-gpu");
         options.addArguments("--no-sandbox");
         options.addArguments("--disable-dev-shm-usage");
@@ -97,40 +97,35 @@ public class WallapopSearchService {
                 log.info("🍪 Cookies aceptadas automáticamente");
             } catch (Exception ignored) {}
 
-            // --- Scroll infinito + "Cargar más" con Selenium ---
-            int maxScrollAttempts = 30;
+         // --- Scroll infinito con "Cargar más" ---
+            JavascriptExecutor js = (JavascriptExecutor) driver;
+            int maxScrollAttempts = 50; // número máximo de intentos
             int scrollAttempts = 0;
-            int lastItemCount = 0;
+            boolean moreResults = true;
 
-            while (scrollAttempts < maxScrollAttempts) {
-                // Scroll hasta el final
-                ((JavascriptExecutor) driver).executeScript("window.scrollTo(0, document.body.scrollHeight);");
+            while (scrollAttempts < maxScrollAttempts && moreResults) {
+                // Hacer scroll hasta el final
+                js.executeScript("window.scrollTo(0, document.body.scrollHeight);");
                 Thread.sleep(1500 + (int)(Math.random() * 1000));
 
-                // Pulsar "Cargar más" si aparece
+                // Buscar botón "Cargar más" y clickearlo si existe
                 try {
-                    List<WebElement> loadBtns = driver.findElements(By.cssSelector(
-                        "div.search-page-results_SearchPageResults__loadMore__A_eRR walla-button"
-                    ));
-                    if (!loadBtns.isEmpty()) {
-                        WebElement btn = loadBtns.get(0);
-                        if (btn.isDisplayed() && btn.isEnabled()) {
+                    List<WebElement> loadBtns = driver.findElements(By.cssSelector("walla-button"));
+                    moreResults = false;
+                    for (WebElement btn : loadBtns) {
+                        if (btn.isDisplayed() && btn.getText().contains("Cargar más")) {
                             btn.click(); // Selenium hace click real
-                            log.info("➡️ Pulsado 'Cargar más' con Selenium");
-                            Thread.sleep(1200 + (int)(Math.random() * 800));
+                            moreResults = true;
+                            log.info("➡️ Pulsado 'Cargar más'");
+                            Thread.sleep(1000 + (int)(Math.random() * 800)); // esperar que cargue
+                            break; // solo clickear uno por iteración
                         }
                     }
                 } catch (Exception ignored) {}
 
-                // Contar items actuales
-                List<WebElement> items = driver.findElements(By.cssSelector("a[href*='/item/']"));
-                if (items.size() == lastItemCount) {
-                    // Si no hay más items nuevos, salimos
-                    break;
-                }
-                lastItemCount = items.size();
                 scrollAttempts++;
             }
+            	
 
             // --- Extraer productos ---
             List<WebElement> items = driver.findElements(By.cssSelector("a[href*='/item/']"));
@@ -148,7 +143,7 @@ public class WallapopSearchService {
                     String image = "";
                     try { image = el.findElement(By.cssSelector("img")).getAttribute("src"); } catch (Exception ignored) {}
 
-                    if (price >= minPrice) {
+                    if (price <= minPrice) {
                         WallapopOffer offer = new WallapopOffer(null, title, priceText, url, price);
                         offer.setImageUrl(image);
                         offers.add(offer);
@@ -181,12 +176,12 @@ public class WallapopSearchService {
         }
         return results;
     }
-
+/*
     @PostConstruct
     public void testSearch() {
         List<WallapopOffer> offers = searchProduct("ps5", 100);
         offers.forEach(o -> log.info("🎯 {} - {} - {}", o.getTitle(), o.getPrice(), o.getUrl()));
-    }
+    }*/
 
     @PreDestroy
     public void shutdown() {
